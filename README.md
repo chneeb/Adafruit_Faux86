@@ -26,7 +26,7 @@ This library depends on the following libraries:
 Out of the box disk images is provided at `disks/` folder, and can be modified by mounting with following command under Linux. For windows/mac you may need to use different tools/commands.
 
 ```
-sudo mount -o loop,offset=1048576,uid=1000,gid=1000 -t vfat /path/to/hd0_12m_dos_games.img ~/mnt
+sudo mount -o loop,offset=32256,uid=1000,gid=1000 -t vfat /path/to/hd0_12m_dos_games.img ~/mnt
 ```
 
 For creating disk image from scratch, you can run [XTulator](https://github.com/mikechambers84/XTulator) and do your own installation.

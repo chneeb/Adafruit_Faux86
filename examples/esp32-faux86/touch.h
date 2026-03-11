@@ -7,18 +7,19 @@
  ******************************************************************************/
 
 /* uncomment for XPT2046 */
-// #define TOUCH_XPT2046
-// #define TOUCH_XPT2046_SCK 12
-// #define TOUCH_XPT2046_MISO 13
-// #define TOUCH_XPT2046_MOSI 11
-// #define TOUCH_XPT2046_CS 10
-// #define TOUCH_XPT2046_INT 18
-// #define TOUCH_XPT2046_ROTATION 0
-// #define TOUCH_XPT2046_SAMPLES 50
+#define TOUCH_XPT2046
+#define TOUCH_XPT2046_SCK 12
+#define TOUCH_XPT2046_MISO 13
+#define TOUCH_XPT2046_MOSI 11
+#define TOUCH_XPT2046_CS 4
+#define TOUCH_XPT2046_INT 255  // no IRQ pin — polled mode (GPIO 18 conflicts with parallel bus)
+#define TOUCH_XPT2046_ROTATION 0
+#define TOUCH_XPT2046_SAMPLES 50
 
 // uncomment for most capacitive touchscreen
-#define TOUCH_MODULES_GT911 // GT911 / CST_SELF / CST_MUTUAL / ZTW622 / L58 /
+//#define TOUCH_MODULES_GT911 // GT911 / CST_SELF / CST_MUTUAL / ZTW622 / L58 /
                             // FT3267 / FT5x06
+/*
 #define TOUCH_MODULE_ADDR                                                      \
   GT911_SLAVE_ADDRESS1 // CTS328_SLAVE_ADDRESS / L58_SLAVE_ADDRESS /
                        // CTS826_SLAVE_ADDRESS / CTS820_SLAVE_ADDRESS /
@@ -30,6 +31,7 @@
 #define TOUCH_SDA 18
 #define TOUCH_RES -1
 #define TOUCH_INT 16
+*/
 
 // Please fill below values from Arduino_GFX Example - TouchCalibration
 bool touch_swap_xy = true;

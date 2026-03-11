@@ -1,0 +1,149 @@
+# Adafruit Faux86 — Claude Code Notes
+
+## Project Overview
+Arduino library wrapping [Faux86-remake](https://github.com/moononournation/Faux86-remake), an 8086 PC emulator targeting ESP32-S3. The main example runs DOS games (e.g. Prince of Persia) on an ILI9341 TFT with a CardKB I2C keyboard.
+
+## Key Files
+- `src/` — Arduino library wrapper (ArduinoInterface, StdioDiskInterface, Keymap, embedded ROM headers)
+- `examples/esp32-faux86/esp32-faux86.ino` — main sketch; all VM config lives here
+- `examples/esp32-faux86/cardkb.h` — CardKB I2C keyboard polling and XT scan code translation
+- `examples/esp32-faux86/touch.h` — touchscreen input (XPT2046, CS=GPIO4, polled mode, active — translates to serial mouse events)
+- `disks/` — disk images (.img) for the VM; upload one to FFat as `hd0_12m_games.img`
+
+## Architecture
+- The Faux86 VM runs in a dedicated FreeRTOS task (`vm86_task`) pinned to **Core 0**, priority 10
+- **`render` task** (Core 1, priority 1) — calls `writePixels()` to blit to the TFT; spawned by `hostInterface.beginRender()` in `setup()` before `vm86_task`
+- `loop()` (Core 1, priority 1) polls the CardKB and XPT2046 touch; same priority as `render` task so they time-share Core 1 without input lag
+- `vm86` is a global `Faux86::VM*` pointer; `cardkb.h` uses it directly, so it must be included after `vm86` is declared
+- `handleKeyDown/Up(uint16_t xt)` only use the **low byte** of the XT scan code — the `0xe0` extended prefix is silently discarded. Arrow keys arrive as numpad scan codes (0x4b/0x4d/0x48/0x50), which DOS games treat identically.
+
+## CardKB Key Codes (v1.1 firmware)
+All four arrow codes are **different from the datasheet** on real hardware — only Left matches:
+| Physical key | CardKB byte | XT scan (low byte sent) |
+|---|---|---|
+| Left  | 0xB4 | 0x4b |
+| Up    | 0xB5 | 0x48 |
+| Down  | 0xB6 | 0x50 |
+| Right | 0xB7 | 0x4d |
+
+## Arduino IDE Board Settings
+| Setting | Value |
+|---|---|
+| Board | ESP32S3 Dev Module |
+| USB CDC On Boot | Enable |
+| Flash Size | 16MB |
+| Partition Scheme | 16M Flash (2M APP/12.5MB FATFS) |
+| PSRAM | OPI PSRAM |
+| Arduino Runs On | Core 1 (default) |
+| Events Run On | Core 0 (default) |
+
+**Note:** Changing partition scheme erases FFat — re-upload the disk image afterwards.
+
+## VM Configuration (esp32-faux86.ino)
+| Setting | Value | Notes |
+|---|---|---|
+| `cpuSpeed` | 0 | 0 = unlimited; already maxed out |
+| `slowSystem` | true | Currently set true in sketch |
+| `enableAudio` | false | Enabling costs significant CPU |
+| `usePCSpeaker` | false | Only set true when enableAudio = true |
+| `frameDelay` | 60 ms | See frameDelay notes below |
+| `framebuffer.width/height` | 720×480 | Only affects secondary render surface, NOT the VGA blit path |
+
+## frameDelay / Watchdog Notes
+`frameDelay` controls how often Core 0 downscales the VGA framebuffer and signals Core 1 to blit.
+Core 0 cost per frame: ~1ms downscale + 1ms `vTaskDelay(1)` (explicit yield to keep IDLE0 alive).
+Core 1 cost per frame: `writePixels()` to the ILI9341 parallel bus (~10–15ms).
+
+The `vTaskDelay(1)` at the end of `blit()` is essential — without it, IDLE0 never runs and the task watchdog fires. Previously `writePixels()` on Core 0 provided implicit yields via the parallel bus driver; moving it to Core 1 removed those.
+
+Tested values with Core 1 rendering:
+| frameDelay | Result |
+|---|---|
+| 60 ms (~16.7 FPS) | Works — current setting |
+| 80 ms (~12.5 FPS) | Works |
+| 100 ms | Works |
+| 150 ms | Works |
+| 50 ms | Watchdog crash (too fast before vTaskDelay fix was added) |
+
+## blit() Implementation (src/ArduinoInterface.cpp)
+The blit function downscales the VGA framebuffer 2×2→1 on Core 0, then signals Core 1 to send it to the TFT.
+Key details:
+- Uses **hardcoded `VGA_FRAMEBUFFER_WIDTH=800`** (from `Faux86-remake/src/Video.h`) as the stride — `vmConfig.framebuffer.width/height` does NOT affect this
+- **Ping-pong buffers**: two `malloc()` buffers (internal SRAM, ~32KB each for 320×200). Core 0 writes to `_frameBuf[_writeIdx]`, Core 1 reads from `_frameBuf[_pendingIdx]`. Indices flip on each blit so neither core touches the same buffer simultaneously (safe because `frameDelay` ≥ 60ms >> writePixels ~15ms).
+- **Nearest-neighbour scaling**: takes the top-left pixel of each 2×2 block instead of averaging all four.
+- **Binary semaphore**: Core 0 gives after downscale; Core 1 takes before `writePixels()`. Extra gives are dropped (frames skipped), never queued.
+- **`vTaskDelay(1)` at end of blit()**: explicit yield to keep IDLE0 alive on Core 0.
+
+## render Task (Core 1)
+- Spawned by `ArduinoHostSystemInterface::beginRender()`, called from `setup()` before `vm86_task`
+- Pinned to Core 1, **priority 1** (same as Arduino loop task) — prevents render from preempting CardKB polling and causing input lag
+- Blocks on `_blitSemaphore` when idle; wakes only when Core 0 signals a new frame
+
+## Performance
+Core 0: 100% dedicated to 8086 emulation except ~2ms per `frameDelay` cycle (downscale + yield).
+Core 1: `writePixels()` (~10–15ms) interleaved with CardKB polling via FreeRTOS round-robin.
+Display FPS = 1000 / frameDelay. At 60ms → ~16.7 FPS, well-suited to DOS-era games.
+
+Other performance knobs:
+- `cpuSpeed=0` — already unlimited
+- ESP32-S3 LX7 at 240MHz — already maximum supported clock; overclocking poorly documented
+
+## Hardware (esp32-faux86 example)
+- Board: ESP32-S3 Dev Module with OPI PSRAM
+- Display: ILI9341 via 8-bit parallel bus (`Arduino_ESP32PAR8`), 320×240, rotation 1
+- Keyboard: M5Stack CardKB v1.1 on I2C (SDA=8, SCL=9, addr=0x5F)
+- Touch: XPT2046 on SPI (SCK=12, MISO=13, MOSI=11, CS=4 / F_CS, no IRQ — GPIO 18 conflicts with parallel bus D2)
+- SD card: SPI (SCK=12, MISO=13, MOSI=11, CS=10), shares bus with XPT2046
+- Storage: SD card preferred; falls back to FFat on internal flash
+
+## SD Card / Touch SPI Pin Notes
+Both XPT2046 and SD card share the SPI bus (SCK=12, MISO=13, MOSI=11) with separate CS pins:
+| Device | CS pin | Label |
+|---|---|---|
+| XPT2046 touch | GPIO 4 | F_CS on shield |
+| SD card | GPIO 10 | — |
+
+`TOUCH_XPT2046_INT = 255` (polled mode) — the natural INT pin (GPIO 18) is occupied by parallel bus D2.
+Touch events are translated to serial mouse in `loop()`: tap = left click down/up, drag = relative move.
+
+## Uploading Disk Images
+**SD card (preferred):** Copy disk image to the root of the SD card as `hd0.img`.
+
+**FFat fallback:** Use the [arduino-esp32fs-plugin](https://github.com/lorol/arduino-esp32fs-plugin):
+1. Place a `.img` file in `examples/esp32-faux86/data/` named `hd0_12m_games.img`
+2. IDE → Tools → ESP32 Sketch Data Upload → FatFS
+
+The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m_games.img`.
+
+## Build Notes
+- Arduino IDE 1.8.x does **not** cache compiled objects — every build is a full rebuild (slow)
+- Upgrading to **Arduino IDE 2.x** gives proper incremental compilation
+- `Config.h` (`DEBUG_CONFIG`, `DEBUG_VM` defined) adds logging overhead; comment these out once things are working to speed up both compile and runtime
+
+## Input Limitations
+- **CardKB reports only one key at a time** — hardware limitation, single byte per I2C poll. No multi-key rollover.
+- Shift+key combos work because the CardKB firmware handles them internally and returns a shifted ASCII code (our code injects a synthetic Shift event around the key).
+- Simultaneous keys (e.g. arrow + letter) are not possible. This affects games like Prince of Persia where Shift+arrow is needed for careful stepping and jumping.
+- Faux86-remake has **no joystick/gameport emulation** (port 0x201 not implemented).
+
+## Arduino ESP32 SDK Notes
+- Arduino ESP32 **3.3.7** bundles **ESP-IDF 5.5.2** (release/v5.5)
+- ESP32-S3 SDK ships with **NimBLE only** — `CONFIG_BLUEDROID_ENABLED` is not set
+- Bluedroid headers (`esp_bt_main.h`, `esp_gap_bt_api.h`, `esp_gap_ble_api.h`) are absent from the S3 SDK
+- ESP32-S3 has **no Classic Bluetooth hardware** — BLE only
+
+## Alternative Keyboard Options (Research Notes)
+### bt-keyboard (turgu1/bt-keyboard) — parked
+- Targets **regular ESP32 only** (dual-mode Classic BT + BLE hardware); not designed for ESP32-S3
+- Uses Bluedroid stack (`CONFIG_BTDM_CTRL_MODE_BTDM=y`, `CONFIG_BT_CLASSIC_ENABLED=y`) — unavailable on S3
+- ESP32-S3 has BLE-only hardware; no Classic BT radio at all
+- IDF version (4.4+) is NOT the blocker
+- To get BLE HID keyboards on S3: rewrite bt layer for NimBLE HID host, or use a different library
+
+## Upstream Dependencies
+- [Faux86-remake](https://github.com/moononournation/Faux86-remake) — the actual 8086 emulator core (not in Library Manager; install from git)
+- Adafruit GFX Library
+- Adafruit ILI9341
+- GFX Library for Arduino (Arduino_GFX)
+- TouchLib / XPT2046_Touchscreen (not in Library Manager; install from git)
+- SD (built into ESP32 Arduino core)

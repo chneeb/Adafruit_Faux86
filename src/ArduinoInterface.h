@@ -26,7 +26,7 @@
 // Disable due to compile issue with arduino-esp32 3.0 with LIST_HEAD()
 // Arduino_DataBus.h:178:13: error: 'i80_device_list' has not been declared
 //  178 |   LIST_HEAD(i80_device_list, lcd_panel_io_i80_t)
-#define DISABLE_ARDUINO_TFT
+// #define DISABLE_ARDUINO_TFT
 
 #ifndef DISABLE_ARDUINO_TFT
 #include <Arduino_TFT.h>
@@ -35,6 +35,7 @@
 #include "StdioDiskInterface.h"
 #include <Adafruit_SPITFT.h>
 #include <VM.h>
+#include <freertos/semphr.h>
 #include <sys/time.h>
 
 namespace Faux86 {
@@ -48,14 +49,28 @@ public:
   virtual void setPalette(Palette *palette) override;
   virtual void blit(uint16_t *pixels, int w, int h, int stride) override;
 
+  // Called once before starting tasks; render loop runs on Core 1
+  void initSemaphore();
+  void renderLoop();
+
 private:
   RenderSurface renderSurface;
 
 #ifndef DISABLE_ARDUINO_TFT
-  Arduino_TFT *_arduino_gfx;
+  Arduino_TFT *_arduino_gfx = nullptr;
 #endif
-  Adafruit_SPITFT *_adafruit_gfx;
-  uint16_t *_rowBuf;
+  Adafruit_SPITFT *_adafruit_gfx = nullptr;
+
+  // Ping-pong buffers: Core 0 writes _frameBuf[_writeIdx],
+  // Core 1 reads _frameBuf[_pendingIdx]
+  uint16_t *_frameBuf[2] = {nullptr, nullptr};
+  int16_t _frameBufW = 0;
+  int16_t _frameBufH = 0;
+  volatile uint8_t _writeIdx = 0;
+  volatile uint8_t _pendingIdx = 0;
+  volatile int16_t _pendingW = 0;
+  volatile int16_t _pendingH = 0;
+  SemaphoreHandle_t _blitSemaphore = nullptr;
 };
 
 class ArduinoTimerInterface : public TimerInterface {
@@ -91,6 +106,13 @@ public:
   virtual DiskInterface *openFile(const char *filename) override;
 
   void tick();
+
+  // Creates the semaphore and spawns the render task on Core 1.
+  // Call from setup() before starting vm86_task.
+  void beginRender();
+
+  // Forwarding shim called by the render task trampoline
+  void renderLoop();
 
 private:
   ArduinoAudioInterface audioInterface;

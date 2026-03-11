@@ -100,10 +100,16 @@ void ArduinoFrameBufferInterface::setPalette(Palette *palette) {
   log_d("ArduinoFrameBufferInterface::setPalette(Palette *palette)");
 }
 
+void ArduinoFrameBufferInterface::initSemaphore() {
+  _blitSemaphore = xSemaphoreCreateBinary();
+}
+
 void ArduinoFrameBufferInterface::blit(uint16_t *pixels, int w, int h,
                                        int stride) {
   // log_d("ArduinoFrameBufferInterface::blit(uint32_t *pixels, %d, %d, %d)", w,
   // h, stride);
+
+  if (!_blitSemaphore) return;
 
 #ifdef DEBUG_TIMING
   static uint8_t blit_fps = 0;
@@ -117,58 +123,89 @@ void ArduinoFrameBufferInterface::blit(uint16_t *pixels, int w, int h,
   return;
 #endif
 
-  int16_t y = 0;
-  uint16_t *row1 = pixels;
-  uint16_t *row2 = pixels + VGA_FRAMEBUFFER_WIDTH;
-  int16_t hQuad = h / 2;
-  int16_t wQuad = w / 2;
-  uint32_t xSkip = ((VGA_FRAMEBUFFER_WIDTH - w) + VGA_FRAMEBUFFER_WIDTH);
-  if (!_rowBuf) {
-    _rowBuf = (uint16_t *)malloc(VGA_FRAMEBUFFER_WIDTH);
-  }
+  int16_t hOut = h / 2;
+  int16_t wOut = w / 2;
 
-  if (_adafruit_gfx) {
-    _adafruit_gfx->startWrite();
-    _adafruit_gfx->setAddrWindow(0, 0, wQuad, hQuad);
+  // Reallocate both ping-pong buffers if video mode resolution changes
+  if (_frameBufW != wOut || _frameBufH != hOut) {
+    if (_frameBuf[0]) { free(_frameBuf[0]); _frameBuf[0] = nullptr; }
+    if (_frameBuf[1]) { free(_frameBuf[1]); _frameBuf[1] = nullptr; }
+    _frameBuf[0] = (uint16_t *)malloc(wOut * hOut * sizeof(uint16_t));
+    _frameBuf[1] = (uint16_t *)malloc(wOut * hOut * sizeof(uint16_t));
+    _frameBufW = wOut;
+    _frameBufH = hOut;
+    _writeIdx = 0;
   }
-#ifndef DISABLE_ARDUINO_TFT
-  else if (_arduino_gfx) {
-    _arduino_gfx->startWrite();
-    _arduino_gfx->writeAddrWindow(0, 0, wQuad, hQuad);
-  }
-#endif
+  if (!_frameBuf[0] || !_frameBuf[1]) return;
 
-  uint16_t p;
-  while (hQuad--) {
-    for (int16_t i = 0; i < wQuad; ++i) {
-      p = (*row1++ & 0b1110011110011100) >> 2;
-      p += (*row1++ & 0b1110011110011100) >> 2;
-      p += (*row2++ & 0b1110011110011100) >> 2;
-      p += (*row2++ & 0b1110011110011100) >> 2;
-      _rowBuf[i] = p;
+  // Nearest-neighbour 2x downscale into the write buffer (Core 0 only)
+  uint8_t wi = _writeIdx;
+  uint16_t *src = pixels;
+  uint32_t rowSkip = VGA_FRAMEBUFFER_WIDTH + (VGA_FRAMEBUFFER_WIDTH - w);
+  uint16_t *dst = _frameBuf[wi];
+
+  for (int16_t y = 0; y < hOut; y++) {
+    for (int16_t i = 0; i < wOut; i++) {
+      *dst++ = *src;
+      src += 2;
     }
+    src += rowSkip;
+  }
+
+  // Publish the completed frame and flip the write index
+  _pendingW = wOut;
+  _pendingH = hOut;
+  _pendingIdx = wi;
+  _writeIdx = wi ^ 1;
+
+  // Signal Core 1 (binary semaphore: extra gives are silently dropped)
+  xSemaphoreGive(_blitSemaphore);
+
+  // Yield to IDLE0: previously writePixels() on Core 0 had implicit yields
+  // inside the parallel bus transfer; now blit is pure memory work so we must
+  // yield explicitly to prevent the task watchdog from firing.
+  vTaskDelay(1);
+}
+
+// Runs on Core 1: waits for a completed frame and sends it to the display.
+void ArduinoFrameBufferInterface::renderLoop() {
+  while (1) {
+    if (xSemaphoreTake(_blitSemaphore, portMAX_DELAY) != pdTRUE) continue;
+
+    uint8_t idx = _pendingIdx;
+    int16_t w   = _pendingW;
+    int16_t h   = _pendingH;
+    uint16_t *buf = _frameBuf[idx];
+    if (!buf || w == 0 || h == 0) continue;
 
     if (_adafruit_gfx) {
-      _adafruit_gfx->writePixels(_rowBuf, wQuad);
+      _adafruit_gfx->startWrite();
+      _adafruit_gfx->setAddrWindow(0, 0, w, h);
+      _adafruit_gfx->writePixels(buf, w * h);
+      _adafruit_gfx->endWrite();
     }
 #ifndef DISABLE_ARDUINO_TFT
     else if (_arduino_gfx) {
-      _arduino_gfx->writePixels(_rowBuf, wQuad);
+      _arduino_gfx->startWrite();
+      _arduino_gfx->writeAddrWindow(0, 0, w, h);
+      _arduino_gfx->writePixels(buf, w * h);
+      _arduino_gfx->endWrite();
     }
 #endif
+  }
+}
 
-    row1 += xSkip;
-    row2 += xSkip;
-  }
+static void render_task_fn(void *param) {
+  static_cast<ArduinoHostSystemInterface *>(param)->renderLoop();
+}
 
-  if (_adafruit_gfx) {
-    _adafruit_gfx->endWrite();
-  }
-#ifndef DISABLE_ARDUINO_TFT
-  else if (_arduino_gfx) {
-    _arduino_gfx->endWrite();
-  }
-#endif
+void ArduinoHostSystemInterface::renderLoop() {
+  frameBufferInterface.renderLoop();
+}
+
+void ArduinoHostSystemInterface::beginRender() {
+  frameBufferInterface.initSemaphore();
+  xTaskCreateUniversal(render_task_fn, "render", 4096, this, 1, nullptr, 1);
 }
 
 uint64_t ArduinoTimerInterface::getHostFreq() {

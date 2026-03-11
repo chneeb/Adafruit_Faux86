@@ -28,35 +28,31 @@
  *"FatFS" then click "OK"
  ******************************************************************************/
 
-#include "Adafruit_GFX.h"
-#include "Adafruit_TinyUSB.h"
 #include "SPI.h"
 
 #include "Adafruit_Faux86.h"
 
-#define TFT_DC 11
-#define TFT_CS 12
-#define TFT_SCK SCK
-#define TFT_MOSI MOSI
-#define TFT_RST -1
+#define TFT_RST 5
 #define TFT_BL -1
-
-#define TFT_SPEED_HZ (60 * 1000 * 1000ul)
 #define TFT_ROTATION 1
 
-#include "Adafruit_ILI9341.h"
-Adafruit_SPITFT *gfx = new Adafruit_ILI9341(&SPI, TFT_DC, TFT_CS, TFT_RST);
+#include <Arduino_GFX_Library.h>
+Arduino_DataBus *bus = new Arduino_ESP32PAR8(7 /* DC */, 6 /* CS */, 1 /* WR */, 2 /* RD */,
+                                              21, 46, 18, 17, 19, 20, 3, 14 /* D0-D7 */);
+Arduino_TFT *gfx = new Arduino_ILI9341(bus, TFT_RST);
 
-#define MAX3421_SCK SCK
-#define MAX3421_MOSI MOSI
-#define MAX3421_MISO MISO
-#define MAX3421_CS 10
-#define MAX3421_INT 9
-Adafruit_USBH_Host USBHost(&SPI, MAX3421_SCK, MAX3421_MOSI, MAX3421_MISO,
-                           MAX3421_CS, MAX3421_INT);
+// CardKB I2C pins — adjust to match your wiring
+#define CARDKB_SDA 8
+#define CARDKB_SCL 9
 
 #include <FFat.h>
+#include <SD.h>
 #include <WiFi.h>
+
+#define SD_CS   10
+#define SD_SCK  12
+#define SD_MISO 13
+#define SD_MOSI 11
 
 Faux86::VM *vm86;
 Faux86::ArduinoHostSystemInterface hostInterface(gfx);
@@ -64,21 +60,29 @@ Faux86::Config vmConfig(&hostInterface);
 
 uint16_t *vga_framebuffer;
 
+// cardkb.h uses vm86, so include after the declaration above
+#include "cardkb.h"
+
 void vm86_task(void *param) {
   (void)param;
 
   if (!FFat.begin(false)) {
-    Serial.println("ERROR: File system mount failed!");
+    Serial.println("WARNING: FFat mount failed");
+  }
+
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  bool sd_ok = SD.begin(SD_CS);
+  if (!sd_ok) {
+    Serial.println("WARNING: SD card mount failed");
   }
 
   /* CPU settings */
   vmConfig.singleThreaded = true; // only WIN32 support multithreading
-  vmConfig.slowSystem =
-      true; // slow system will reserve more time for audio, if enabled
+  vmConfig.slowSystem = true; // no audio, so no need to reserve time for it
   vmConfig.cpuSpeed = 0; // no limit
 
   /* Video settings */
-  vmConfig.frameDelay = 200; // 200ms 5fps
+  vmConfig.frameDelay = 60; // 50ms — Core 1 handles display; Core 0 just downscales
   vmConfig.framebuffer.width = 720;
   vmConfig.framebuffer.height = 480;
 
@@ -87,7 +91,7 @@ void vm86_task(void *param) {
   vmConfig.useDisneySoundSource = false;
   vmConfig.useSoundBlaster = false;
   vmConfig.useAdlib = false;
-  vmConfig.usePCSpeaker = true;
+  vmConfig.usePCSpeaker = false; // no audio output, skip speaker emulation
   vmConfig.audio.sampleRate = 22050; // 32000 //44100 //48000;
   vmConfig.audio.latency = 200;
 
@@ -112,9 +116,15 @@ void vm86_task(void *param) {
   /* floppy drive image */
   // vmConfig.diskDriveA = hostInterface.openFile("/ffat/fd0.img");
 
-  // harddisk drive image: can be found in disks/ folder
+  // harddisk drive image: try SD card first, fall back to FFat
   // vmConfig.diskDriveC = hostInterface.openFile("/ffat/hd0_12m_win30.img");
-  vmConfig.diskDriveC = hostInterface.openFile("/ffat/hd0_12m_games.img");
+  if (sd_ok && SD.exists("/hd0.img")) {
+    Serial.println("Loading disk image from SD card");
+    vmConfig.diskDriveC = hostInterface.openFile("/sd/hd0.img");
+  } else {
+    Serial.println("Loading disk image from FFat");
+    vmConfig.diskDriveC = hostInterface.openFile("/ffat/hd0_12m_games.img");
+  }
 
   /* set boot drive */
   vmConfig.setBootDrive("hd0");
@@ -191,7 +201,7 @@ void setup() {
   Serial.println("esp32-faux86");
 
   Serial.println("Init display");
-  gfx->begin(TFT_SPEED_HZ);
+  gfx->begin();
   gfx->setRotation(TFT_ROTATION);
   gfx->fillScreen(0x000000); // black
 
@@ -219,18 +229,51 @@ void setup() {
   attachInterrupt(TDECK_TRACKBALL_CLICK, ISR_click, FALLING);
 #endif
 
+  Serial.println("Init CardKB");
+  Wire.begin(CARDKB_SDA, CARDKB_SCL);
+
+  Serial.println("Init touchscreen");
+  touch_init(gfx->width(), gfx->height(), gfx->getRotation());
+
+  // Start the render task on Core 1 (priority 5) before the VM task
+  hostInterface.beginRender();
+
   // Create a thread with high priority to run VM 86
   // For S3" since we don't use wifi in this example. We can it on core0
   xTaskCreateUniversal(vm86_task, "vm86", 8192, NULL, 10, NULL, 0);
-
-  Serial.println("Init USBHost with MAX3421");
-  if (!USBHost.begin(1)) {
-    Serial.println("Failed to init USBHost");
-  }
 }
 
 void loop() {
-  USBHost.task();
+  if (vm86) {
+    cardkb_poll();
+  }
+
+  /* touch → serial mouse */
+  static int16_t prev_tx = -1, prev_ty = -1;
+  static bool touch_was_down = false;
+  if (vm86) {
+    if (touch_has_signal() && touch_touched()) {
+      if (!touch_was_down) {
+        vm86->mouse.handleButtonDown(Faux86::SerialMouse::ButtonType::Left);
+        touch_was_down = true;
+        prev_tx = touch_last_x;
+        prev_ty = touch_last_y;
+      } else {
+        int16_t dx = touch_last_x - prev_tx;
+        int16_t dy = touch_last_y - prev_ty;
+        if (dx || dy) {
+          vm86->mouse.handleMove(dx, dy);
+          prev_tx = touch_last_x;
+          prev_ty = touch_last_y;
+        }
+      }
+    } else if (touch_was_down) {
+      vm86->mouse.handleButtonUp(Faux86::SerialMouse::ButtonType::Left);
+      touch_was_down = false;
+      prev_tx = -1;
+      prev_ty = -1;
+    }
+  }
 
 #if 0
   /* handle trackball input */
@@ -262,112 +305,3 @@ void loop() {
   }
 #endif
 }
-
-// look up new key in previous keys
-static bool find_key_in_report(hid_keyboard_report_t const *report,
-                               uint8_t keycode) {
-  for (uint8_t i = 0; i < 6; i++) {
-    if (report->keycode[i] == keycode)
-      return true;
-  }
-  return false;
-}
-
-static void process_kbd_report(hid_keyboard_report_t const *report) {
-  // previous report to check key released
-  static hid_keyboard_report_t prev_report = {0, 0, {0}};
-
-  // modifier
-  for (uint8_t i = 0; i < 8; i++) {
-    uint8_t const mask = 1 << i;
-    uint8_t const new_modifier = report->modifier & mask;
-    uint8_t const old_modifier = prev_report.modifier & mask;
-    if (new_modifier != old_modifier) {
-      // modifier change
-      if (new_modifier) {
-        vm86->input.handleKeyDown(modifier2xtMapping[i]);
-      } else {
-        vm86->input.handleKeyUp(modifier2xtMapping[i]);
-      }
-
-      vm86->input.tick();
-    }
-  }
-
-  // keycode
-  for (uint8_t i = 0; i < 6; i++) {
-    // new key pressed
-    uint8_t const new_key = report->keycode[i];
-    if (new_key && !find_key_in_report(&prev_report, new_key)) {
-      vm86->input.handleKeyDown(usb2xtMapping[new_key]);
-      vm86->input.tick();
-    }
-
-    // old key released
-    uint8_t const old_key = prev_report.keycode[i];
-    if (old_key && !find_key_in_report(report, old_key)) {
-      vm86->input.handleKeyUp(usb2xtMapping[old_key]);
-      vm86->input.tick();
-    }
-  }
-
-  prev_report = *report;
-}
-
-//--------------------------------------------------------------------+
-// TinyUSB Host callbacks
-//--------------------------------------------------------------------+
-
-extern "C" {
-// Invoked when device with hid interface is mounted
-// Report descriptor is also available for use.
-// tuh_hid_parse_report_descriptor() can be used to parse common/simple enough
-// descriptor. Note: if report descriptor length > CFG_TUH_ENUMERATION_BUFSIZE,
-// it will be skipped therefore report_desc = NULL, desc_len = 0
-void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
-                      uint8_t const *desc_report, uint16_t desc_len) {
-  (void)desc_report;
-  (void)desc_len;
-
-  uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-  if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
-    Serial.printf("HID Keyboard mounted\r\n");
-    if (!tuh_hid_receive_report(dev_addr, instance)) {
-      Serial.printf("Error: cannot request to receive report\r\n");
-    }
-  }
-}
-
-// Invoked when device with hid interface is un-mounted
-void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
-  Serial.printf("HID device address = %d, instance = %d is unmounted\r\n",
-                dev_addr, instance);
-}
-
-// Invoked when received report from device via interrupt endpoint
-void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
-                                uint8_t const *report, uint16_t len) {
-  (void)len;
-  uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-  // Serial.printf("HID report len = %u\r\n", len);
-
-  switch (itf_protocol) {
-  case HID_ITF_PROTOCOL_KEYBOARD:
-    process_kbd_report((hid_keyboard_report_t const *)report);
-    break;
-
-  case HID_ITF_PROTOCOL_MOUSE:
-    // process_mouse_report((hid_mouse_report_t const *) report);
-    break;
-
-  default:
-    break;
-  }
-
-  // continue to request to receive report
-  if (!tuh_hid_receive_report(dev_addr, instance)) {
-    Serial.printf("Error: cannot request to receive report\r\n");
-  }
-}
-
-} // extern "C"
