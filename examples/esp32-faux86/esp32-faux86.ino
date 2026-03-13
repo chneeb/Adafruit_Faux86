@@ -8,51 +8,79 @@
  * - Faux86-remake: https://github.com/moononournation/Faux86-remake.git
  *   Note: on Linux, you may need to make change as
  *https://github.com/ArnoldUK/Faux86-remake/pull/5
- * - Adafruit GFX: https://github.com/adafruit/Adafruit-GFX-Library and your
- *specific TFT library controller e.g. Adafruit_ILI9341
- * - Arduino_GFX: https://github.com/moononournation/Arduino_GFX.git
+ * - Adafruit GFX: https://github.com/adafruit/Adafruit-GFX-Library
+ * - Adafruit ILI9341: https://github.com/adafruit/Adafruit_ILI9341
+ * - XPT2046_Touchscreen: https://github.com/PaulStoffregen/XPT2046_Touchscreen.git
+ * - Adafruit TinyUSB (INPUT_USB_HID only): https://github.com/adafruit/Adafruit_TinyUSB_Arduino
  * - For uploading files to FFat:
  *https://github.com/lorol/arduino-esp32fs-plugin
  *
  * Arduino IDE Settings
  * Board:            "ESP32S3 Dev Module"
- * USB CDC On Boot:  "Enable"
  * Partition Scheme: "16M Flash(2M APP/12.5MB FATFS)"
+ * PSRAM:            "OPI PSRAM"
  *
- * uploaded one of img file in disks/ to ESP32-S3 using
- *[arduino-esp32fs-plugin](https://github.com/lorol/arduino-esp32fs-plugin)
- * - Install arduino-esp32fs-plugin
- * - Create a folder named "data" in the sketch folder
- * - Copy one of the img file in disks/ to "data" folder
- * - From IDE menu select: "Tools" -> "ESP32 Sketch Data Upload" then select
- *"FatFS" then click "OK"
+ * INPUT_USB_HID:
+ *   USB CDC On Boot: "Disable"  (native USB OTG port = keyboard host)
+ *   Connect USB keyboard to the OTG/native USB port (GPIO19/20).
+ *   Use the UART/COM port for Serial monitor.
+ *
+ * INPUT_CARDKB:
+ *   USB CDC On Boot: "Enable"
  ******************************************************************************/
 
-#include "SPI.h"
+// ── Input method ─────────────────────────────────────────────────────────────
+// Uncomment ONE:
+//#define INPUT_USB_HID  // Native ESP32-S3 USB OTG host (N-key rollover, real keyboard)
+#define INPUT_CARDKB // M5Stack CardKB v1.1 I2C (single key, no rollover)
 
-#include "Adafruit_Faux86.h"
-
-#define TFT_RST 5
-#define TFT_BL -1
+// ── Display: SPI ILI9341 on SPI2 ─────────────────────────────────────────────
+// SPI2 default pins on ESP32-S3: SCK=12, MISO=13, MOSI=11
+// Adjust TFT_DC to match your wiring (any free GPIO, e.g. GPIO 7):
+#define TFT_DC       7
+#define TFT_CS       10
+#define TFT_RST      6
+#define TFT_BL       15
 #define TFT_ROTATION 1
+#define TFT_SPEED_HZ (60 * 1000 * 1000ul)
 
-#include <Arduino_GFX_Library.h>
-Arduino_DataBus *bus = new Arduino_ESP32PAR8(7 /* DC */, 6 /* CS */, 1 /* WR */, 2 /* RD */,
-                                              21, 46, 18, 17, 19, 20, 3, 14 /* D0-D7 */);
-Arduino_TFT *gfx = new Arduino_ILI9341(bus, TFT_RST);
-
-// CardKB I2C pins — adjust to match your wiring
-#define CARDKB_SDA 8
-#define CARDKB_SCL 9
-
+// ── SD card: SPI3 ─────────────────────────────────────────────────────────────
+// SPI3 has no IO_MUX defaults on ESP32-S3; pins must be explicit.
+// GPIO 26-37 are reserved for OPI PSRAM — use 39-42 instead.
+#define SD_CS   39
+#define SD_SCK  40
+#define SD_MISO 41
+#define SD_MOSI 42
+ 
+#include "SPI.h"
+#include "Adafruit_Faux86.h"
+#include "Adafruit_ILI9341.h"
 #include <FFat.h>
 #include <SD.h>
 #include <WiFi.h>
 
-#define SD_CS   10
-#define SD_SCK  12
-#define SD_MISO 13
-#define SD_MOSI 11
+#ifdef INPUT_USB_HID
+#include "Adafruit_TinyUSB.h"
+// Native ESP32-S3 USB OTG host — no SPI/MAX3421 chip needed.
+Adafruit_USBH_Host USBHost;
+#endif
+
+#ifdef INPUT_CARDKB
+#include <Wire.h>
+#define CARDKB_SDA 8
+#define CARDKB_SCL 9
+#endif
+
+// SPI2 bus shared by ILI9341 and XPT2046 (different CS pins):
+SPIClass spi2(SPI2);
+// SPI3 bus for SD card:
+SPIClass spi3(SPI3);
+
+Adafruit_ILI9341 *gfx = new Adafruit_ILI9341(&spi2, TFT_DC, TFT_CS, TFT_RST);
+
+// Tell touch.h to share our spi2 object instead of the default SPI:
+#define TOUCH_XPT2046_SPI_CLASS spi2
+#include "touch.h"
 
 Faux86::VM *vm86;
 Faux86::ArduinoHostSystemInterface hostInterface(gfx);
@@ -60,29 +88,38 @@ Faux86::Config vmConfig(&hostInterface);
 
 uint16_t *vga_framebuffer;
 
-// cardkb.h uses vm86, so include after the declaration above
+#ifdef INPUT_CARDKB
+// cardkb.h uses vm86, so include after vm86 is declared:
 #include "cardkb.h"
+#endif
 
 void vm86_task(void *param) {
   (void)param;
+  Serial.println("vm86_task: started");
 
+  Serial.println("vm86_task: mounting FFat");
   if (!FFat.begin(false)) {
     Serial.println("WARNING: FFat mount failed");
+  } else {
+    Serial.println("vm86_task: FFat OK");
   }
 
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  bool sd_ok = SD.begin(SD_CS);
+  Serial.println("vm86_task: init SPI3 / SD");
+  spi3.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  bool sd_ok = SD.begin(SD_CS, spi3);
   if (!sd_ok) {
     Serial.println("WARNING: SD card mount failed");
+  } else {
+    Serial.println("vm86_task: SD OK");
   }
 
   /* CPU settings */
   vmConfig.singleThreaded = true; // only WIN32 support multithreading
-  vmConfig.slowSystem = true; // no audio, so no need to reserve time for it
+  vmConfig.slowSystem = true;
   vmConfig.cpuSpeed = 0; // no limit
 
   /* Video settings */
-  vmConfig.frameDelay = 60; // 50ms — Core 1 handles display; Core 0 just downscales
+  vmConfig.frameDelay = 60; // ms; Core 1 handles display, Core 0 just downscales
   vmConfig.framebuffer.width = 720;
   vmConfig.framebuffer.height = 480;
 
@@ -91,33 +128,25 @@ void vm86_task(void *param) {
   vmConfig.useDisneySoundSource = false;
   vmConfig.useSoundBlaster = false;
   vmConfig.useAdlib = false;
-  vmConfig.usePCSpeaker = false; // no audio output, skip speaker emulation
-  vmConfig.audio.sampleRate = 22050; // 32000 //44100 //48000;
+  vmConfig.usePCSpeaker = false;
+  vmConfig.audio.sampleRate = 22050;
   vmConfig.audio.latency = 200;
 
   /* set BIOS ROM */
-  // vmConfig.biosFile = hostInterface.openFile("/ffat/pcxtbios.bin");
   vmConfig.biosFile = new Faux86::EmbeddedDisk(pcxtbios_bin, pcxtbios_bin_len);
 
   /* set Basic ROM */
-  // vmConfig.romBasicFile = hostInterface.openFile("/ffat/rombasic.bin");
   vmConfig.romBasicFile =
       new Faux86::EmbeddedDisk(rombasic_bin, rombasic_bin_len);
 
   /* set Video ROM */
-  // vmConfig.videoRomFile = hostInterface.openFile("/ffat/videorom.bin");
   vmConfig.videoRomFile =
       new Faux86::EmbeddedDisk(videorom_bin, videorom_bin_len);
 
   /* set ASCII FONT Data */
-  // vmConfig.asciiFile = hostInterface.openFile("/ffat/asciivga.dat");
   vmConfig.asciiFile = new Faux86::EmbeddedDisk(asciivga_dat, asciivga_dat_len);
 
-  /* floppy drive image */
-  // vmConfig.diskDriveA = hostInterface.openFile("/ffat/fd0.img");
-
   // harddisk drive image: try SD card first, fall back to FFat
-  // vmConfig.diskDriveC = hostInterface.openFile("/ffat/hd0_12m_win30.img");
   if (sd_ok && SD.exists("/hd0.img")) {
     Serial.println("Loading disk image from SD card");
     vmConfig.diskDriveC = hostInterface.openFile("/sd/hd0.img");
@@ -129,124 +158,95 @@ void vm86_task(void *param) {
   /* set boot drive */
   vmConfig.setBootDrive("hd0");
 
+  Serial.printf("vm86_task: free heap before alloc: %u\n", esp_get_free_heap_size());
   vga_framebuffer = (uint16_t *)calloc(
       VGA_FRAMEBUFFER_WIDTH * VGA_FRAMEBUFFER_HEIGHT, sizeof(uint16_t));
   if (!vga_framebuffer) {
-    Serial.println("Failed to allocate vga_framebuffer");
+    Serial.println("FATAL: Failed to allocate vga_framebuffer");
+    vTaskDelete(NULL);
   }
+  Serial.printf("vm86_task: vga_framebuffer OK (%u bytes), free heap: %u\n",
+                VGA_FRAMEBUFFER_WIDTH * VGA_FRAMEBUFFER_HEIGHT * sizeof(uint16_t),
+                esp_get_free_heap_size());
 
+  Serial.println("vm86_task: creating VM");
   vm86 = new Faux86::VM(vmConfig);
+  Serial.println("vm86_task: calling vm86->init()");
   if (vm86->init()) {
+    Serial.println("vm86_task: VM init OK, calling hostInterface.init()");
     hostInterface.init(vm86);
+    Serial.println("vm86_task: entering simulate loop");
+  } else {
+    Serial.println("FATAL: VM init failed");
+    vTaskDelete(NULL);
   }
 
   while (1) {
     vm86->simulate();
-    // hostInterface.tick();
-
-    // simulated() call yield() inside but since this is highest priority task
-    // we should call vTaskDelay(1) to allow other task to run
     vTaskDelay(1);
   }
 }
 
-/*******************************************************************************
- * Please config the touch panel in touch.h
- ******************************************************************************/
-#include "touch.h"
-
-#define TRACK_SPEED 2
-bool trackball_interrupted = false;
-int16_t trackball_up_count = 1;
-int16_t trackball_down_count = 1;
-int16_t trackball_left_count = 1;
-int16_t trackball_right_count = 1;
-int16_t trackball_click_count = 0;
-bool mouse_downed = false;
-
-void IRAM_ATTR ISR_up() {
-  trackball_interrupted = true;
-  trackball_up_count <<= TRACK_SPEED;
-}
-
-void IRAM_ATTR ISR_down() {
-  trackball_interrupted = true;
-  trackball_down_count <<= TRACK_SPEED;
-}
-
-void IRAM_ATTR ISR_left() {
-  trackball_interrupted = true;
-  trackball_left_count <<= TRACK_SPEED;
-}
-
-void IRAM_ATTR ISR_right() {
-  trackball_interrupted = true;
-  trackball_right_count <<= TRACK_SPEED;
-}
-
-void IRAM_ATTR ISR_click() {
-  trackball_interrupted = true;
-  ++trackball_click_count;
-}
-
-//--------------------------------------------------------------------+
-//
-//--------------------------------------------------------------------+
 void setup() {
   WiFi.mode(WIFI_OFF);
 
   Serial.begin(115200);
-  // Serial.setDebugOutput(true);
-  // while(!Serial) delay(10);
+  Serial.setDebugOutput(true);  // route ESP-IDF log/panic output to Serial
   Serial.println("esp32-faux86");
 
+  // Initialise SPI2 bus once (default pins: SCK=12, MISO=13, MOSI=11);
+  // ILI9341 and XPT2046 both share it.
+  spi2.begin();
+
   Serial.println("Init display");
-  gfx->begin();
+  gfx->begin(TFT_SPEED_HZ);
   gfx->setRotation(TFT_ROTATION);
-  gfx->fillScreen(0x000000); // black
+  gfx->fillScreen(0x0000);
 
 #if defined(TFT_BL) && (TFT_BL != -1)
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 #endif
 
-#if 0
-  Wire.begin(TDECK_I2C_SDA, TDECK_I2C_SCL, TDECK_I2C_FREQ);
-
-  Serial.println("Init touchscreen");
-  touch_init(gfx->width(), gfx->height(), gfx->getRotation());
-
-  // Init trackball
-  pinMode(TDECK_TRACKBALL_UP, INPUT_PULLUP);
-  attachInterrupt(TDECK_TRACKBALL_UP, ISR_up, FALLING);
-  pinMode(TDECK_TRACKBALL_DOWN, INPUT_PULLUP);
-  attachInterrupt(TDECK_TRACKBALL_DOWN, ISR_down, FALLING);
-  pinMode(TDECK_TRACKBALL_LEFT, INPUT_PULLUP);
-  attachInterrupt(TDECK_TRACKBALL_LEFT, ISR_left, FALLING);
-  pinMode(TDECK_TRACKBALL_RIGHT, INPUT_PULLUP);
-  attachInterrupt(TDECK_TRACKBALL_RIGHT, ISR_right, FALLING);
-  pinMode(TDECK_TRACKBALL_CLICK, INPUT_PULLUP);
-  attachInterrupt(TDECK_TRACKBALL_CLICK, ISR_click, FALLING);
-#endif
-
+#ifdef INPUT_CARDKB
   Serial.println("Init CardKB");
   Wire.begin(CARDKB_SDA, CARDKB_SCL);
+#endif
 
   Serial.println("Init touchscreen");
   touch_init(gfx->width(), gfx->height(), gfx->getRotation());
+  Serial.println("Init touchscreen done");
 
-  // Start the render task on Core 1 (priority 5) before the VM task
+  Serial.printf("Free heap before tasks: %u\n", esp_get_free_heap_size());
+
+  // Start the render task on Core 1 before the VM task:
+  Serial.println("Starting render task");
   hostInterface.beginRender();
+  Serial.println("Render task started");
 
-  // Create a thread with high priority to run VM 86
-  // For S3" since we don't use wifi in this example. We can it on core0
+  // VM runs on Core 0, priority 10:
+  Serial.println("Starting vm86 task");
   xTaskCreateUniversal(vm86_task, "vm86", 8192, NULL, 10, NULL, 0);
+  Serial.println("setup() done");
+
+#ifdef INPUT_USB_HID
+  Serial.println("Init USB host (native OTG)");
+  if (!USBHost.begin(1)) {
+    Serial.println("Failed to init USBHost");
+  }
+#endif
 }
 
 void loop() {
+#ifdef INPUT_USB_HID
+  USBHost.task();
+#endif
+
+#ifdef INPUT_CARDKB
   if (vm86) {
     cardkb_poll();
   }
+#endif
 
   /* touch → serial mouse */
   static int16_t prev_tx = -1, prev_ty = -1;
@@ -274,34 +274,84 @@ void loop() {
       prev_ty = -1;
     }
   }
+}
 
-#if 0
-  /* handle trackball input */
-  if (trackball_interrupted) {
-    if (trackball_click_count > 0) {
-      Serial.println("vm86->mouse.handleButtonDown(Faux86::SerialMouse::ButtonType::Left);");
-      vm86->mouse.handleButtonDown(Faux86::SerialMouse::ButtonType::Left);
-      mouse_downed = true;
-    }
-    int16_t x_delta = trackball_right_count - trackball_left_count;
-    int16_t y_delta = trackball_down_count - trackball_up_count;
-    if ((x_delta != 0) || (y_delta != 0)) {
-      Serial.printf("x_delta: %d, y_delta: %d\n", x_delta, y_delta);
-      vm86->mouse.handleMove(x_delta, y_delta);
-    }
-    trackball_interrupted = false;
-    trackball_up_count = 1;
-    trackball_down_count = 1;
-    trackball_left_count = 1;
-    trackball_right_count = 1;
-    trackball_click_count = 0;
-  } else if (mouse_downed) {
-    if (digitalRead(TDECK_TRACKBALL_CLICK) == HIGH) // released
-    {
-      Serial.println("vm86->mouse.handleButtonUp(Faux86::SerialMouse::ButtonType::Left);");
-      vm86->mouse.handleButtonUp(Faux86::SerialMouse::ButtonType::Left);
-      mouse_downed = false;
+#ifdef INPUT_USB_HID
+//--------------------------------------------------------------------+
+// USB HID keyboard callbacks (TinyUSB host)
+//--------------------------------------------------------------------+
+
+static bool find_key_in_report(hid_keyboard_report_t const *report,
+                               uint8_t keycode) {
+  for (uint8_t i = 0; i < 6; i++) {
+    if (report->keycode[i] == keycode)
+      return true;
+  }
+  return false;
+}
+
+static void process_kbd_report(hid_keyboard_report_t const *report) {
+  static hid_keyboard_report_t prev_report = {0, 0, {0}};
+
+  // modifiers
+  for (uint8_t i = 0; i < 8; i++) {
+    uint8_t const mask = 1 << i;
+    uint8_t const new_mod = report->modifier & mask;
+    uint8_t const old_mod = prev_report.modifier & mask;
+    if (new_mod != old_mod) {
+      if (new_mod)
+        vm86->input.handleKeyDown(modifier2xtMapping[i]);
+      else
+        vm86->input.handleKeyUp(modifier2xtMapping[i]);
+      vm86->input.tick();
     }
   }
-#endif
+
+  // keycodes (up to 6 simultaneous)
+  for (uint8_t i = 0; i < 6; i++) {
+    uint8_t const new_key = report->keycode[i];
+    if (new_key && !find_key_in_report(&prev_report, new_key)) {
+      vm86->input.handleKeyDown(usb2xtMapping[new_key]);
+      vm86->input.tick();
+    }
+    uint8_t const old_key = prev_report.keycode[i];
+    if (old_key && !find_key_in_report(report, old_key)) {
+      vm86->input.handleKeyUp(usb2xtMapping[old_key]);
+      vm86->input.tick();
+    }
+  }
+
+  prev_report = *report;
 }
+
+extern "C" {
+
+void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
+                      uint8_t const *desc_report, uint16_t desc_len) {
+  (void)desc_report;
+  (void)desc_len;
+  if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD) {
+    Serial.println("HID Keyboard mounted");
+    if (!tuh_hid_receive_report(dev_addr, instance)) {
+      Serial.println("Error: cannot request keyboard report");
+    }
+  }
+}
+
+void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
+  Serial.printf("HID device %d instance %d unmounted\r\n", dev_addr, instance);
+}
+
+void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
+                                uint8_t const *report, uint16_t len) {
+  (void)len;
+  if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD) {
+    process_kbd_report((hid_keyboard_report_t const *)report);
+  }
+  if (!tuh_hid_receive_report(dev_addr, instance)) {
+    Serial.println("Error: cannot request report");
+  }
+}
+
+} // extern "C"
+#endif // INPUT_USB_HID

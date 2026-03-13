@@ -7,7 +7,7 @@
  ******************************************************************************/
 
 /* uncomment for XPT2046 */
-#define TOUCH_XPT2046
+//#define TOUCH_XPT2046
 #define TOUCH_XPT2046_SCK 12
 #define TOUCH_XPT2046_MISO 13
 #define TOUCH_XPT2046_MOSI 11
@@ -47,6 +47,12 @@ int16_t touch_last_x = 0, touch_last_y = 0;
 #if defined(TOUCH_XPT2046)
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+// Allow the calling sketch to override which SPI bus XPT2046 uses.
+// Define TOUCH_XPT2046_SPI_CLASS before including this header to redirect
+// (e.g. #define TOUCH_XPT2046_SPI_CLASS hspi for a shared HSPI bus).
+#ifndef TOUCH_XPT2046_SPI_CLASS
+#define TOUCH_XPT2046_SPI_CLASS SPI
+#endif
 XPT2046_Touchscreen ts(TOUCH_XPT2046_CS, TOUCH_XPT2046_INT);
 
 #elif defined(TOUCH_MODULE_ADDR) // TouchLib
@@ -93,9 +99,9 @@ void touch_init(int16_t w, int16_t h, uint8_t r) {
   }
 
 #if defined(TOUCH_XPT2046)
-  SPI.begin(TOUCH_XPT2046_SCK, TOUCH_XPT2046_MISO, TOUCH_XPT2046_MOSI,
-            TOUCH_XPT2046_CS);
-  ts.begin();
+  TOUCH_XPT2046_SPI_CLASS.begin(TOUCH_XPT2046_SCK, TOUCH_XPT2046_MISO,
+                                TOUCH_XPT2046_MOSI, TOUCH_XPT2046_CS);
+  ts.begin(TOUCH_XPT2046_SPI_CLASS);
   ts.setRotation(TOUCH_XPT2046_ROTATION);
 
 #elif defined(TOUCH_MODULE_ADDR) // TouchLib

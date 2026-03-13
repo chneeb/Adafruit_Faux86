@@ -90,21 +90,30 @@ Other performance knobs:
 
 ## Hardware (esp32-faux86 example)
 - Board: ESP32-S3 Dev Module with OPI PSRAM
-- Display: ILI9341 via 8-bit parallel bus (`Arduino_ESP32PAR8`), 320×240, rotation 1
-- Keyboard: M5Stack CardKB v1.1 on I2C (SDA=8, SCL=9, addr=0x5F)
-- Touch: XPT2046 on SPI (SCK=12, MISO=13, MOSI=11, CS=4 / F_CS, no IRQ — GPIO 18 conflicts with parallel bus D2)
-- SD card: SPI (SCK=12, MISO=13, MOSI=11, CS=10), shares bus with XPT2046
-- Storage: SD card preferred; falls back to FFat on internal flash
+- Display: ILI9341 via SPI (SPI2: SCK=12, MISO=13, MOSI=11, CS=10, DC=7), 320×240, rotation 1
+- Keyboard: **INPUT_USB_HID** (default) — USB keyboard on native OTG port (GPIO19/20); or **INPUT_CARDKB** — M5Stack CardKB v1.1 on I2C (SDA=8, SCL=9, addr=0x5F)
+- Touch: XPT2046 on SPI2 bus (shared with ILI9341), CS=4, polled mode (INT=255)
+- SD card: SPI3 (SCK=40, MISO=41, MOSI=42, CS=39)
+- Storage: SD card preferred (`/sd/hd0.img`); falls back to FFat (`/ffat/hd0_12m_games.img`)
 
-## SD Card / Touch SPI Pin Notes
-Both XPT2046 and SD card share the SPI bus (SCK=12, MISO=13, MOSI=11) with separate CS pins:
-| Device | CS pin | Label |
-|---|---|---|
-| XPT2046 touch | GPIO 4 | F_CS on shield |
-| SD card | GPIO 10 | — |
+## SPI Bus Assignments
+| Bus | SCK | MISO | MOSI | Devices |
+|---|---|---|---|---|
+| SPI2 | 12 | 13 | 11 | ILI9341 (CS=10, DC=7) + XPT2046 (CS=4) |
+| SPI3 | 40 | 41 | 42 | SD card (CS=39) |
 
-`TOUCH_XPT2046_INT = 255` (polled mode) — the natural INT pin (GPIO 18) is occupied by parallel bus D2.
-Touch events are translated to serial mouse in `loop()`: tap = left click down/up, drag = relative move.
+Both `spi2` and `spi3` are `SPIClass` globals in the sketch. `touch.h` uses `TOUCH_XPT2046_SPI_CLASS` (defined as `spi2`) so it shares the SPI2 bus with the TFT.
+
+`TOUCH_XPT2046_INT = 255` (polled mode). Touch events are translated to serial mouse in `loop()`.
+
+## Input Method Selection
+Set at the top of `esp32-faux86.ino`:
+```cpp
+#define INPUT_USB_HID   // native ESP32-S3 USB OTG — full keyboard, N-key rollover
+//#define INPUT_CARDKB  // M5Stack CardKB — single key, no rollover
+```
+**INPUT_USB_HID board settings**: USB CDC On Boot = **Disable**; connect keyboard to the OTG/native USB port; use UART/COM port for Serial monitor.
+**INPUT_CARDKB board settings**: USB CDC On Boot = Enable (or either).
 
 ## Uploading Disk Images
 **SD card (preferred):** Copy disk image to the root of the SD card as `hd0.img`.
