@@ -168,6 +168,33 @@ The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m
 - IDF version (4.4+) is NOT the blocker
 - To get BLE HID keyboards on S3: rewrite bt layer for NimBLE HID host, or use a different library
 
+## PlatformIO Build (working)
+Files: `examples/esp32-faux86/platformio.ini` + `partitions_16MB_fatfs.csv`
+Sketch and headers live in `examples/esp32-faux86/src/` (PlatformIO convention).
+
+### Key lessons learned during migration
+- **Use pioarduino platform, not official espressif32.** The official `espressif32` platform (even 6.13.0) ships arduino-esp32 2.x (IDF 4.4.7). This causes silent early boot crashes on hardware using OPI PSRAM + IDF 5.x APIs. Use `platform = https://github.com/pioarduino/platform-espressif32/releases/download/stable/platform-espressif32.zip` which tracks arduino-esp32 3.x (IDF 5.x), matching Arduino IDE 3.3.7.
+- **USB mode: use `build_unflags` + `build_flags`.** The board JSON defines `ARDUINO_USB_MODE=1` (Hardware CDC). Override with `build_unflags = -DARDUINO_USB_MODE=1` then `build_flags = -DARDUINO_USB_MODE=0`. Using `-U/-D` inline or `board_build.arduino.usb_mode` both fail (redefinition warnings or silently ignored).
+- **Adafruit_Faux86 library: use `symlink://../..` in lib_deps.** The library is the repo itself; `symlink://` references it in-place so PlatformIO compiles its `src/` correctly.
+- **faux86-remake headers: explicit `-I` needed.** PlatformIO doesn't propagate include paths between libraries. Add `-I${PROJECT_LIBDEPS_DIR}/${PIOENV}/faux86-remake/src` to `build_flags` so Adafruit_Faux86's sources can find `DriveManager.h` etc.
+- **`StdioDiskInterface.h` include fix.** Changed `#include "../src/DriveManager.h"` → `#include "DriveManager.h"` (the `../src/` relative path was an Arduino IDE artifact that broke under PlatformIO).
+- **Adafruit BusIO must be listed explicitly.** PlatformIO doesn't resolve transitive dependencies automatically; `Adafruit_GFX` pulls in `Adafruit_I2CDevice.h` from BusIO.
+- **PSRAM verification.** PSRAM shows as `.ext_ram.bss` sections in the link map. If absent, check `IDF_VER` in verbose build output — IDF 4.4.x means wrong platform/framework.
+
+### Data upload
+Replace arduino-esp32fs-plugin with:
+```bash
+pio run --target uploadfs   # uploads data/ to FFat
+```
+
+### USB mode per input method
+Change these two values in `build_unflags` / `build_flags` to match `INPUT_*`:
+| Input method | `ARDUINO_USB_MODE` | `ARDUINO_USB_CDC_ON_BOOT` |
+|---|---|---|
+| `INPUT_USB_HID_ESPUSBHOST` (default) | 0 | 0 |
+| `INPUT_USB_HID_TINYUSB` | 0 | 0 |
+| `INPUT_CARDKB` | 1 | 1 |
+
 ## Upstream Dependencies
 - [Faux86-remake](https://github.com/moononournation/Faux86-remake) — the actual 8086 emulator core (not in Library Manager; install from git)
 - Adafruit GFX Library
