@@ -7,6 +7,7 @@ Arduino library wrapping [Faux86-remake](https://github.com/moononournation/Faux
 - `src/` — Arduino library wrapper (ArduinoInterface, StdioDiskInterface, Keymap, embedded ROM headers)
 - `examples/esp32-faux86/esp32-faux86.ino` — main sketch; all VM config lives here
 - `examples/esp32-faux86/cardkb.h` — CardKB I2C keyboard polling and XT scan code translation
+- `examples/esp32-faux86/blekb.h` — BLE keyboard server (T-HMI-C64 Android app compatible); C64 matrix → XT scan code translation
 - `examples/esp32-faux86/usbhid_espusbhost.h` — EspUsbHost subclass; overrides `onKeyboard()` to translate HID reports to XT scan codes
 - `examples/esp32-faux86/touch.h` — touchscreen input (XPT2046, CS=GPIO4, polled mode, active — translates to serial mouse events)
 - `disks/` — disk images (.img) for the VM; upload one to FFat as `hd0_12m_games.img`
@@ -92,7 +93,7 @@ Other performance knobs:
 ## Hardware (esp32-faux86 example)
 - Board: ESP32-S3 Dev Module with OPI PSRAM
 - Display: ILI9341 via SPI (SPI2: SCK=12, MISO=13, MOSI=11, CS=10, DC=7), 320×240, rotation 1
-- Keyboard: **INPUT_USB_HID_ESPUSBHOST** (default) — EspUsbHost on native OTG port (GPIO19/20); or **INPUT_USB_HID_TINYUSB** (legacy TinyUSB); or **INPUT_CARDKB** — M5Stack CardKB v1.1 on I2C (SDA=8, SCL=9, addr=0x5F)
+- Keyboard: **INPUT_USB_HID_ESPUSBHOST** — EspUsbHost on native OTG port (GPIO19/20); or **INPUT_USB_HID_TINYUSB** (legacy TinyUSB); or **INPUT_CARDKB** — M5Stack CardKB v1.1 on I2C (SDA=8, SCL=9, addr=0x5F); or **INPUT_BLE** — BLE server compatible with T-HMI-C64 Android app
 - Touch: XPT2046 on SPI2 bus (shared with ILI9341), CS=4, polled mode (INT=255)
 - SD card: SPI3 (SCK=40, MISO=41, MOSI=42, CS=39)
 - Storage: SD card preferred (`/sd/hd0.img`); falls back to FFat (`/ffat/hd0_12m_games.img`)
@@ -108,11 +109,12 @@ Both `spi2` and `spi3` are `SPIClass` globals in the sketch. `touch.h` uses `TOU
 `TOUCH_XPT2046_INT = 255` (polled mode). Touch events are translated to serial mouse in `loop()`.
 
 ## Input Method Selection
-Set at the top of `esp32-faux86.ino`:
+Set via PlatformIO build flags (`-DINPUT_*`) in `platformio.ini`, or uncomment at the top of `esp32-faux86.ino`:
 ```cpp
-#define INPUT_USB_HID_ESPUSBHOST  // EspUsbHost — native OTG, N-key rollover (default)
-//#define INPUT_USB_HID_TINYUSB   // TinyUSB    — native OTG, N-key rollover (legacy)
-//#define INPUT_CARDKB            // M5Stack CardKB — single key, no rollover
+//#define INPUT_USB_HID_ESPUSBHOST  // EspUsbHost — native OTG, N-key rollover
+//#define INPUT_USB_HID_TINYUSB     // TinyUSB    — native OTG, N-key rollover (legacy)
+//#define INPUT_CARDKB              // M5Stack CardKB — single key, no rollover
+//#define INPUT_BLE                 // BLE — T-HMI-C64 Android app compatible
 ```
 
 | Define | USB Mode | USB CDC On Boot | Serial monitor port |
@@ -120,6 +122,7 @@ Set at the top of `esp32-faux86.ino`:
 | `INPUT_USB_HID_ESPUSBHOST` | Hardware CDC and JTAG (TBD — see note) | Disable | UART/COM (CH340/CP2102) |
 | `INPUT_USB_HID_TINYUSB` | USB-OTG (TinyUSB) | Disable | UART/COM (CH340/CP2102) |
 | `INPUT_CARDKB` | either | Enable | USB CDC or UART |
+| `INPUT_BLE` | Hardware CDC and JTAG | Enable | USB CDC or UART |
 
 **Note on USB Mode for EspUsbHost:** not yet confirmed. EspUsbHost uses `usb_host_install()` (ESP-IDF OTG host driver) which may conflict with "Hardware CDC and JTAG" taking ownership of GPIO19/20. Still needs testing — try "Hardware CDC and JTAG" first, then "USB-OTG (TinyUSB)" if it doesn't work.
 
@@ -143,8 +146,10 @@ The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m
 
 ## Input Limitations
 - **CardKB reports only one key at a time** — hardware limitation, single byte per I2C poll. No multi-key rollover.
-- Shift+key combos work because the CardKB firmware handles them internally and returns a shifted ASCII code (our code injects a synthetic Shift event around the key).
-- Simultaneous keys (e.g. arrow + letter) are not possible. This affects games like Prince of Persia where Shift+arrow is needed for careful stepping and jumping.
+- **CardKB uses sticky modifiers** — Shift and Sym are latch keys (LED blinks once); next key pressed combines with the modifier. Simultaneous physical keypresses are impossible; the firmware handles the combination internally and returns a single ASCII byte.
+- Shift+key combos work because the CardKB firmware returns a shifted ASCII code; our code injects a synthetic Shift keydown/up around the resulting XT scan code.
+- Sym+key gives special characters (e.g. Sym+/ = `\`); again handled entirely by the CardKB firmware.
+- Simultaneous keys (e.g. arrow + letter) are not possible with CardKB. This affects games like Prince of Persia where Shift+arrow is needed for careful stepping and jumping.
 - Faux86-remake has **no joystick/gameport emulation** (port 0x201 not implemented).
 
 ## Arduino ESP32 SDK Notes
@@ -152,6 +157,25 @@ The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m
 - ESP32-S3 SDK ships with **NimBLE only** — `CONFIG_BLUEDROID_ENABLED` is not set
 - Bluedroid headers (`esp_bt_main.h`, `esp_gap_bt_api.h`, `esp_gap_ble_api.h`) are absent from the S3 SDK
 - ESP32-S3 has **no Classic Bluetooth hardware** — BLE only
+
+## BLE Keyboard (INPUT_BLE) — T-HMI-C64 Android app compatible
+- File: `examples/esp32-faux86/src/blekb.h` (header-only, included after `vm86` is declared)
+- Advertises as `"THMIC64"` with the same BLE service/characteristic UUIDs as the [T-HMI-C64](https://github.com/retroelec/T-HMI-C64) project — the same Android app works with Faux86
+- No extra library needed; BLE is built into arduino-esp32 3.x (NimBLE stack)
+- Protocol: 3 bytes per keypress — DC00 (row-select), DC01 (column), modifier (0xFF=release)
+  - modifier bit 0 = Shift, bit 1 = Ctrl, bit 2 = Commodore, bit 7 = external cmd (ignored)
+- C64 → XT scan code mapping via an 8×8 table indexed by (row, col) decoded from DC00/DC01
+- Cursor direction reversal: CRSR→ + shift bit → Left; CRSR↓ + shift bit → Up
+  - Allows the Android app's 4-direction cursor buttons to work correctly in Faux86
+  - Holding on-screen LSHIFT + ← = Shift+Left in Faux86 (careful movement in PoP) ✓
+- LSHIFT, CTRL, CBM (→ LAlt) tracked independently so they can be held during other keys
+- Key mapping notes (differences from expected C64 layout):
+  - C64 `+` → numpad + (0x4E); C64 `=` → = key (0x0D)
+  - C64 `:` → ; key (0x27); user presses LSHIFT for `:`
+  - C64 `@` → 2 key (0x03); user presses LSHIFT for `@`
+  - C64 `↑` (caret symbol) → backslash (0x2B)
+  - C64 `←` (back-arrow) → backtick/~ (0x29)
+  - C64 RUN/STOP → Escape; C64 HOME → numpad 7/Home; C64 £ → unmapped
 
 ## Alternative Keyboard Options (Research Notes)
 ### EspUsbHost (tanakamasayuki/EspUsbHost) — integrated, pending hardware test
@@ -172,28 +196,12 @@ The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m
 Files: `examples/esp32-faux86/platformio.ini` + `partitions_16MB_fatfs.csv`
 Sketch and headers live in `examples/esp32-faux86/src/` (PlatformIO convention).
 
-### Planned: define-flag switching (not yet implemented)
-Goal: switch between parallel ILI9341 + CardKB and SPI ILI9341 + EspUsbHost by flipping two `#define` lines at the top of the sketch — same pattern as the existing `INPUT_*` defines. Single PlatformIO environment, no env switching needed.
+### Display / Input switching via build flags (implemented)
+Switch display and input method by editing the `-DDISPLAY_*` and `-DINPUT_*` flags in `platformio.ini`, and updating `ARDUINO_USB_MODE` / `ARDUINO_USB_CDC_ON_BOOT` to match (see USB mode table below).
 
-**Approach:**
-1. **`esp32-faux86.ino`** — add a `DISPLAY_*` define block at the top alongside `INPUT_*`:
-   ```cpp
-   #define DISPLAY_PARALLEL  // parallel ILI9341 via Arduino_GFX
-   //#define DISPLAY_SPI     // SPI ILI9341 via Adafruit_ILI9341
-   ```
-   Replace the hardcoded display/SD pin block with `#ifdef DISPLAY_PARALLEL` / `#ifdef DISPLAY_SPI` guards. Guard SD wiring and `setup()` init (spi2.begin, gfx->begin speed arg) accordingly.
+The sketch selects display headers via `#ifdef DISPLAY_PARALLEL` / `#ifdef DISPLAY_SPI`, and input headers via `#ifdef INPUT_CARDKB` etc. Single PlatformIO environment — no env switching needed.
 
-2. **`src/ArduinoInterface.h`** — replace the hardcoded `#define DISABLE_ARDUINO_TFT` with:
-   ```cpp
-   #ifdef DISPLAY_SPI
-   #define DISABLE_ARDUINO_TFT
-   #endif
-   ```
-   This lets the parallel path use `Arduino_TFT *gfx` and the SPI path use `Adafruit_SPITFT *gfx` without touching the header to switch.
-
-3. **`platformio.ini`** — keep single env; list all libs together (`Adafruit_ILI9341`, `Arduino_GFX`, `EspUsbHost`). USB mode still needs manual update to match `INPUT_*` (see table below) — or accept that CardKB users set USB mode once and leave it.
-
-**Key detail — `DISABLE_ARDUINO_TFT`:** this define exists because `Arduino_DataBus.h` in Arduino_GFX causes a compile error on arduino-esp32 3.x (`LIST_HEAD` / `i80_device_list`). Driving it from `DISPLAY_SPI` means the error is suppressed for SPI builds while the parallel path keeps Arduino_TFT enabled. Verify the installed Arduino_GFX version has fixed this before implementing — if not, the parallel build will still fail.
+**`DISABLE_ARDUINO_TFT` note:** this define in `src/ArduinoInterface.h` suppresses a compile error from `Arduino_DataBus.h` in Arduino_GFX (`LIST_HEAD` / `i80_device_list` conflict on arduino-esp32 3.x). It is set for `DISPLAY_SPI` builds; the parallel path keeps Arduino_TFT enabled.
 
 ### Key lessons learned during migration
 - **Use pioarduino platform, not official espressif32.** The official `espressif32` platform (even 6.13.0) ships arduino-esp32 2.x (IDF 4.4.7). This causes silent early boot crashes on hardware using OPI PSRAM + IDF 5.x APIs. Use `platform = https://github.com/pioarduino/platform-espressif32/releases/download/stable/platform-espressif32.zip` which tracks arduino-esp32 3.x (IDF 5.x), matching Arduino IDE 3.3.7.
@@ -214,9 +222,10 @@ pio run --target uploadfs   # uploads data/ to FFat
 Change these two values in `build_unflags` / `build_flags` to match `INPUT_*`:
 | Input method | `ARDUINO_USB_MODE` | `ARDUINO_USB_CDC_ON_BOOT` |
 |---|---|---|
-| `INPUT_USB_HID_ESPUSBHOST` (default) | 0 | 0 |
+| `INPUT_USB_HID_ESPUSBHOST` | 0 | 0 |
 | `INPUT_USB_HID_TINYUSB` | 0 | 0 |
 | `INPUT_CARDKB` | 1 | 1 |
+| `INPUT_BLE` | 1 | 1 |
 
 ## Upstream Dependencies
 - [Faux86-remake](https://github.com/moononournation/Faux86-remake) — the actual 8086 emulator core (not in Library Manager; install from git)

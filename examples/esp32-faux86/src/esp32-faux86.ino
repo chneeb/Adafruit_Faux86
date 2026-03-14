@@ -42,6 +42,7 @@
 //#define INPUT_USB_HID_ESPUSBHOST // EspUsbHost — native OTG, N-key rollover
 //#define INPUT_USB_HID_TINYUSB   // TinyUSB    — native OTG, N-key rollover
 //#define INPUT_CARDKB             // M5Stack CardKB v1.1 I2C (single key, no rollover)
+//#define INPUT_BLE                // BLE — T-HMI-C64 Android app compatible
 
 // ── Display ───────────────────────────────────────────────────────────────────
 // Set via PlatformIO build flag (-DDISPLAY_PARALLEL or -DDISPLAY_SPI) or uncomment ONE:
@@ -97,6 +98,11 @@ uint16_t *vga_framebuffer;
 // usbhid_espusbhost.h uses vm86, so include after vm86 is declared:
 #include "usbhid_espusbhost.h"
 Faux86UsbHost USBHost;
+#endif
+
+#ifdef INPUT_BLE
+// blekb.h uses vm86, so include after vm86 is declared:
+#include "blekb.h"
 #endif
 
 void vm86_task(void *param) {
@@ -201,7 +207,10 @@ void vm86_task(void *param) {
 }
 
 void setup() {
+#ifndef INPUT_BLE
+  // BLE uses the same RF subsystem; don't disable it when BLE is active.
   WiFi.mode(WIFI_OFF);
+#endif
 
   Serial.begin(115200);
   Serial.setDebugOutput(true);  // route ESP-IDF log/panic output to Serial
@@ -258,6 +267,11 @@ void setup() {
 #ifdef INPUT_USB_HID_ESPUSBHOST
   Serial.println("Init USB host (EspUsbHost)");
   USBHost.begin();
+#endif
+
+#ifdef INPUT_BLE
+  Serial.println("Init BLE keyboard");
+  blekb_init();
 #endif
 }
 
