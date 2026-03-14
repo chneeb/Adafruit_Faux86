@@ -23,10 +23,12 @@
 */
 #pragma once
 
-// Disable due to compile issue with arduino-esp32 3.0 with LIST_HEAD()
-// Arduino_DataBus.h:178:13: error: 'i80_device_list' has not been declared
-//  178 |   LIST_HEAD(i80_device_list, lcd_panel_io_i80_t)
+// DISPLAY_SPI builds inject -DDISABLE_ARDUINO_TFT via platformio.ini build_flags
+// to avoid a compile error in Arduino_DataBus.h on arduino-esp32 3.x (LIST_HEAD).
+// DISPLAY_PARALLEL builds need Arduino_TFT enabled, so no define here.
+#ifdef DISPLAY_SPI
 #define DISABLE_ARDUINO_TFT
+#endif
 
 #ifndef DISABLE_ARDUINO_TFT
 #include <Arduino_TFT.h>

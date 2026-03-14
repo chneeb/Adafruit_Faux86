@@ -172,6 +172,29 @@ The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m
 Files: `examples/esp32-faux86/platformio.ini` + `partitions_16MB_fatfs.csv`
 Sketch and headers live in `examples/esp32-faux86/src/` (PlatformIO convention).
 
+### Planned: define-flag switching (not yet implemented)
+Goal: switch between parallel ILI9341 + CardKB and SPI ILI9341 + EspUsbHost by flipping two `#define` lines at the top of the sketch — same pattern as the existing `INPUT_*` defines. Single PlatformIO environment, no env switching needed.
+
+**Approach:**
+1. **`esp32-faux86.ino`** — add a `DISPLAY_*` define block at the top alongside `INPUT_*`:
+   ```cpp
+   #define DISPLAY_PARALLEL  // parallel ILI9341 via Arduino_GFX
+   //#define DISPLAY_SPI     // SPI ILI9341 via Adafruit_ILI9341
+   ```
+   Replace the hardcoded display/SD pin block with `#ifdef DISPLAY_PARALLEL` / `#ifdef DISPLAY_SPI` guards. Guard SD wiring and `setup()` init (spi2.begin, gfx->begin speed arg) accordingly.
+
+2. **`src/ArduinoInterface.h`** — replace the hardcoded `#define DISABLE_ARDUINO_TFT` with:
+   ```cpp
+   #ifdef DISPLAY_SPI
+   #define DISABLE_ARDUINO_TFT
+   #endif
+   ```
+   This lets the parallel path use `Arduino_TFT *gfx` and the SPI path use `Adafruit_SPITFT *gfx` without touching the header to switch.
+
+3. **`platformio.ini`** — keep single env; list all libs together (`Adafruit_ILI9341`, `Arduino_GFX`, `EspUsbHost`). USB mode still needs manual update to match `INPUT_*` (see table below) — or accept that CardKB users set USB mode once and leave it.
+
+**Key detail — `DISABLE_ARDUINO_TFT`:** this define exists because `Arduino_DataBus.h` in Arduino_GFX causes a compile error on arduino-esp32 3.x (`LIST_HEAD` / `i80_device_list`). Driving it from `DISPLAY_SPI` means the error is suppressed for SPI builds while the parallel path keeps Arduino_TFT enabled. Verify the installed Arduino_GFX version has fixed this before implementing — if not, the parallel build will still fail.
+
 ### Key lessons learned during migration
 - **Use pioarduino platform, not official espressif32.** The official `espressif32` platform (even 6.13.0) ships arduino-esp32 2.x (IDF 4.4.7). This causes silent early boot crashes on hardware using OPI PSRAM + IDF 5.x APIs. Use `platform = https://github.com/pioarduino/platform-espressif32/releases/download/stable/platform-espressif32.zip` which tracks arduino-esp32 3.x (IDF 5.x), matching Arduino IDE 3.3.7.
 - **USB mode: use `build_unflags` + `build_flags`.** The board JSON defines `ARDUINO_USB_MODE=1` (Hardware CDC). Override with `build_unflags = -DARDUINO_USB_MODE=1` then `build_flags = -DARDUINO_USB_MODE=0`. Using `-U/-D` inline or `board_build.arduino.usb_mode` both fail (redefinition warnings or silently ignored).

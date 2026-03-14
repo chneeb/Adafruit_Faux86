@@ -38,39 +38,31 @@
  ******************************************************************************/
 
 // ── Input method ─────────────────────────────────────────────────────────────
-// Uncomment ONE:
-#define INPUT_USB_HID_ESPUSBHOST // EspUsbHost — native OTG, N-key rollover (USB Mode: Hardware CDC and JTAG)
-//#define INPUT_USB_HID_TINYUSB  // TinyUSB    — native OTG, N-key rollover (USB Mode: USB-OTG TinyUSB)
-//#define INPUT_CARDKB           // M5Stack CardKB v1.1 I2C (single key, no rollover)
+// Set via PlatformIO build flag (-DINPUT_CARDKB etc.) or uncomment ONE here:
+//#define INPUT_USB_HID_ESPUSBHOST // EspUsbHost — native OTG, N-key rollover
+//#define INPUT_USB_HID_TINYUSB   // TinyUSB    — native OTG, N-key rollover
+//#define INPUT_CARDKB             // M5Stack CardKB v1.1 I2C (single key, no rollover)
 
-// ── Display: SPI ILI9341 on SPI2 ─────────────────────────────────────────────
-// SPI2 default pins on ESP32-S3: SCK=12, MISO=13, MOSI=11
-// Adjust TFT_DC to match your wiring (any free GPIO, e.g. GPIO 7):
-#define TFT_DC       7
-#define TFT_CS       10
-#define TFT_RST      6
-#define TFT_BL       15
-#define TFT_ROTATION 1
-#define TFT_SPEED_HZ (60 * 1000 * 1000ul)
+// ── Display ───────────────────────────────────────────────────────────────────
+// Set via PlatformIO build flag (-DDISPLAY_PARALLEL or -DDISPLAY_SPI) or uncomment ONE:
+//#define DISPLAY_PARALLEL  // parallel ILI9341 via Arduino_GFX (CardKB board)
+//#define DISPLAY_SPI       // SPI ILI9341 via Adafruit_ILI9341 (EspUsbHost board)
 
-// ── SD card: SPI3 ─────────────────────────────────────────────────────────────
-// SPI3 has no IO_MUX defaults on ESP32-S3; pins must be explicit.
-// GPIO 26-37 are reserved for OPI PSRAM — use 39-42 instead.
-#define SD_CS   39
-#define SD_SCK  40
-#define SD_MISO 41
-#define SD_MOSI 42
- 
+// ── Display: select via -DDISPLAY_PARALLEL or -DDISPLAY_SPI build flag ────────
+#ifdef DISPLAY_PARALLEL
+#include "display_parallel.h"
+#elif defined(DISPLAY_SPI)
+#include "display_spi.h"
+#endif
+
 #include "SPI.h"
 #include "Adafruit_Faux86.h"
-#include "Adafruit_ILI9341.h"
 #include <FFat.h>
 #include <SD.h>
 #include <WiFi.h>
 
 #ifdef INPUT_USB_HID_TINYUSB
 #include "Adafruit_TinyUSB.h"
-// Native ESP32-S3 USB OTG host via TinyUSB stack.
 Adafruit_USBH_Host USBHost;
 #endif
 
@@ -80,16 +72,14 @@ Adafruit_USBH_Host USBHost;
 #define CARDKB_SCL 9
 #endif
 
-// Reference: https://curiousscientist.tech/blog/esp32-s3-multiple-spi-buses-spi-fspi-hspi
-// SPI2 bus shared by ILI9341 and XPT2046 (different CS pins):
-SPIClass spi2(FSPI);
-// SPI3 bus for SD card:
-SPIClass spi3(HSPI);
-
-Adafruit_ILI9341 *gfx = new Adafruit_ILI9341(&spi2, TFT_DC, TFT_CS, TFT_RST);
-
-// Tell touch.h to share our spi2 object instead of the default SPI:
+// ── XPT2046 touch ─────────────────────────────────────────────────────────────
+// Parallel board: enabled, shares default SPI bus with SD card.
+// SPI board: XPT2046 is wired but disabled (touch functions become no-ops).
+#ifdef DISPLAY_PARALLEL
+#define TOUCH_XPT2046
+#elif defined(DISPLAY_SPI)
 #define TOUCH_XPT2046_SPI_CLASS spi2
+#endif
 #include "touch.h"
 
 Faux86::VM *vm86;
@@ -120,9 +110,16 @@ void vm86_task(void *param) {
     Serial.println("vm86_task: FFat OK");
   }
 
-  Serial.println("vm86_task: init SPI3 / SD");
-  spi3.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  bool sd_ok = SD.begin(SD_CS, spi3);
+  Serial.println("vm86_task: init SD");
+#ifdef DISPLAY_PARALLEL
+  // SD on default SPI bus: SCK=12, MISO=13, MOSI=11, CS=10 (shared with XPT2046)
+  SPI.begin(12, 13, 11, 10);
+  bool sd_ok = SD.begin(10);
+#elif defined(DISPLAY_SPI)
+  // SD on SPI3: SCK=40, MISO=41, MOSI=42, CS=39 (GPIO 26-37 reserved for OPI PSRAM)
+  spi3.begin(40, 41, 42, 39);
+  bool sd_ok = SD.begin(39, spi3);
+#endif
   if (!sd_ok) {
     Serial.println("WARNING: SD card mount failed");
   } else {
@@ -210,12 +207,18 @@ void setup() {
   Serial.setDebugOutput(true);  // route ESP-IDF log/panic output to Serial
   Serial.println("esp32-faux86");
 
+#ifdef DISPLAY_SPI
   // Initialise SPI2 bus once (default pins: SCK=12, MISO=13, MOSI=11);
   // ILI9341 and XPT2046 both share it.
   spi2.begin();
+#endif
 
   Serial.println("Init display");
+#ifdef DISPLAY_SPI
   gfx->begin(TFT_SPEED_HZ);
+#else
+  gfx->begin();
+#endif
   gfx->setRotation(TFT_ROTATION);
   gfx->fillScreen(0x0000);
 
@@ -298,81 +301,6 @@ void loop() {
 }
 
 #ifdef INPUT_USB_HID_TINYUSB
-//--------------------------------------------------------------------+
-// USB HID keyboard callbacks (TinyUSB host)
-//--------------------------------------------------------------------+
-
-static bool find_key_in_report(hid_keyboard_report_t const *report,
-                               uint8_t keycode) {
-  for (uint8_t i = 0; i < 6; i++) {
-    if (report->keycode[i] == keycode)
-      return true;
-  }
-  return false;
-}
-
-static void process_kbd_report(hid_keyboard_report_t const *report) {
-  static hid_keyboard_report_t prev_report = {0, 0, {0}};
-
-  // modifiers
-  for (uint8_t i = 0; i < 8; i++) {
-    uint8_t const mask = 1 << i;
-    uint8_t const new_mod = report->modifier & mask;
-    uint8_t const old_mod = prev_report.modifier & mask;
-    if (new_mod != old_mod) {
-      if (new_mod)
-        vm86->input.handleKeyDown(modifier2xtMapping[i]);
-      else
-        vm86->input.handleKeyUp(modifier2xtMapping[i]);
-      vm86->input.tick();
-    }
-  }
-
-  // keycodes (up to 6 simultaneous)
-  for (uint8_t i = 0; i < 6; i++) {
-    uint8_t const new_key = report->keycode[i];
-    if (new_key && !find_key_in_report(&prev_report, new_key)) {
-      vm86->input.handleKeyDown(usb2xtMapping[new_key]);
-      vm86->input.tick();
-    }
-    uint8_t const old_key = prev_report.keycode[i];
-    if (old_key && !find_key_in_report(report, old_key)) {
-      vm86->input.handleKeyUp(usb2xtMapping[old_key]);
-      vm86->input.tick();
-    }
-  }
-
-  prev_report = *report;
-}
-
-extern "C" {
-
-void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
-                      uint8_t const *desc_report, uint16_t desc_len) {
-  (void)desc_report;
-  (void)desc_len;
-  if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD) {
-    Serial.println("HID Keyboard mounted");
-    if (!tuh_hid_receive_report(dev_addr, instance)) {
-      Serial.println("Error: cannot request keyboard report");
-    }
-  }
-}
-
-void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
-  Serial.printf("HID device %d instance %d unmounted\r\n", dev_addr, instance);
-}
-
-void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
-                                uint8_t const *report, uint16_t len) {
-  (void)len;
-  if (tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD) {
-    process_kbd_report((hid_keyboard_report_t const *)report);
-  }
-  if (!tuh_hid_receive_report(dev_addr, instance)) {
-    Serial.println("Error: cannot request report");
-  }
-}
-
-} // extern "C"
+// usbhid_tinyusb.h uses vm86, so include after vm86 is declared:
+#include "usbhid_tinyusb.h"
 #endif // INPUT_USB_HID_TINYUSB
