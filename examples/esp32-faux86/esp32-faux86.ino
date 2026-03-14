@@ -11,7 +11,8 @@
  * - Adafruit GFX: https://github.com/adafruit/Adafruit-GFX-Library
  * - Adafruit ILI9341: https://github.com/adafruit/Adafruit_ILI9341
  * - XPT2046_Touchscreen: https://github.com/PaulStoffregen/XPT2046_Touchscreen.git
- * - Adafruit TinyUSB (INPUT_USB_HID only): https://github.com/adafruit/Adafruit_TinyUSB_Arduino
+ * - Adafruit TinyUSB (INPUT_USB_HID_TINYUSB only): https://github.com/adafruit/Adafruit_TinyUSB_Arduino
+ * - EspUsbHost (INPUT_USB_HID_ESPUSBHOST only): https://github.com/tanakamasayuki/EspUsbHost
  * - For uploading files to FFat:
  *https://github.com/lorol/arduino-esp32fs-plugin
  *
@@ -20,8 +21,15 @@
  * Partition Scheme: "16M Flash(2M APP/12.5MB FATFS)"
  * PSRAM:            "OPI PSRAM"
  *
- * INPUT_USB_HID:
- *   USB CDC On Boot: "Disable"  (native USB OTG port = keyboard host)
+ * INPUT_USB_HID_ESPUSBHOST (default USB keyboard):
+ *   USB Mode:        "Hardware CDC and JTAG"
+ *   USB CDC On Boot: "Disable"
+ *   Connect USB keyboard to the OTG/native USB port (GPIO19/20).
+ *   Use the UART/COM port for Serial monitor.
+ *
+ * INPUT_USB_HID_TINYUSB (legacy USB keyboard):
+ *   USB Mode:        "USB-OTG (TinyUSB)"
+ *   USB CDC On Boot: "Disable"
  *   Connect USB keyboard to the OTG/native USB port (GPIO19/20).
  *   Use the UART/COM port for Serial monitor.
  *
@@ -31,8 +39,9 @@
 
 // ── Input method ─────────────────────────────────────────────────────────────
 // Uncomment ONE:
-//#define INPUT_USB_HID  // Native ESP32-S3 USB OTG host (N-key rollover, real keyboard)
-#define INPUT_CARDKB // M5Stack CardKB v1.1 I2C (single key, no rollover)
+#define INPUT_USB_HID_ESPUSBHOST // EspUsbHost — native OTG, N-key rollover (USB Mode: Hardware CDC and JTAG)
+//#define INPUT_USB_HID_TINYUSB  // TinyUSB    — native OTG, N-key rollover (USB Mode: USB-OTG TinyUSB)
+//#define INPUT_CARDKB           // M5Stack CardKB v1.1 I2C (single key, no rollover)
 
 // ── Display: SPI ILI9341 on SPI2 ─────────────────────────────────────────────
 // SPI2 default pins on ESP32-S3: SCK=12, MISO=13, MOSI=11
@@ -59,9 +68,9 @@
 #include <SD.h>
 #include <WiFi.h>
 
-#ifdef INPUT_USB_HID
+#ifdef INPUT_USB_HID_TINYUSB
 #include "Adafruit_TinyUSB.h"
-// Native ESP32-S3 USB OTG host — no SPI/MAX3421 chip needed.
+// Native ESP32-S3 USB OTG host via TinyUSB stack.
 Adafruit_USBH_Host USBHost;
 #endif
 
@@ -71,10 +80,11 @@ Adafruit_USBH_Host USBHost;
 #define CARDKB_SCL 9
 #endif
 
+// Reference: https://curiousscientist.tech/blog/esp32-s3-multiple-spi-buses-spi-fspi-hspi
 // SPI2 bus shared by ILI9341 and XPT2046 (different CS pins):
-SPIClass spi2(SPI2);
+SPIClass spi2(FSPI);
 // SPI3 bus for SD card:
-SPIClass spi3(SPI3);
+SPIClass spi3(HSPI);
 
 Adafruit_ILI9341 *gfx = new Adafruit_ILI9341(&spi2, TFT_DC, TFT_CS, TFT_RST);
 
@@ -91,6 +101,12 @@ uint16_t *vga_framebuffer;
 #ifdef INPUT_CARDKB
 // cardkb.h uses vm86, so include after vm86 is declared:
 #include "cardkb.h"
+#endif
+
+#ifdef INPUT_USB_HID_ESPUSBHOST
+// usbhid_espusbhost.h uses vm86, so include after vm86 is declared:
+#include "usbhid_espusbhost.h"
+Faux86UsbHost USBHost;
 #endif
 
 void vm86_task(void *param) {
@@ -229,16 +245,21 @@ void setup() {
   xTaskCreateUniversal(vm86_task, "vm86", 8192, NULL, 10, NULL, 0);
   Serial.println("setup() done");
 
-#ifdef INPUT_USB_HID
-  Serial.println("Init USB host (native OTG)");
+#ifdef INPUT_USB_HID_TINYUSB
+  Serial.println("Init USB host (TinyUSB)");
   if (!USBHost.begin(1)) {
     Serial.println("Failed to init USBHost");
   }
 #endif
+
+#ifdef INPUT_USB_HID_ESPUSBHOST
+  Serial.println("Init USB host (EspUsbHost)");
+  USBHost.begin();
+#endif
 }
 
 void loop() {
-#ifdef INPUT_USB_HID
+#if defined(INPUT_USB_HID_TINYUSB) || defined(INPUT_USB_HID_ESPUSBHOST)
   USBHost.task();
 #endif
 
@@ -276,7 +297,7 @@ void loop() {
   }
 }
 
-#ifdef INPUT_USB_HID
+#ifdef INPUT_USB_HID_TINYUSB
 //--------------------------------------------------------------------+
 // USB HID keyboard callbacks (TinyUSB host)
 //--------------------------------------------------------------------+
@@ -354,4 +375,4 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 }
 
 } // extern "C"
-#endif // INPUT_USB_HID
+#endif // INPUT_USB_HID_TINYUSB

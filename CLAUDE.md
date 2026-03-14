@@ -7,6 +7,7 @@ Arduino library wrapping [Faux86-remake](https://github.com/moononournation/Faux
 - `src/` — Arduino library wrapper (ArduinoInterface, StdioDiskInterface, Keymap, embedded ROM headers)
 - `examples/esp32-faux86/esp32-faux86.ino` — main sketch; all VM config lives here
 - `examples/esp32-faux86/cardkb.h` — CardKB I2C keyboard polling and XT scan code translation
+- `examples/esp32-faux86/usbhid_espusbhost.h` — EspUsbHost subclass; overrides `onKeyboard()` to translate HID reports to XT scan codes
 - `examples/esp32-faux86/touch.h` — touchscreen input (XPT2046, CS=GPIO4, polled mode, active — translates to serial mouse events)
 - `disks/` — disk images (.img) for the VM; upload one to FFat as `hd0_12m_games.img`
 
@@ -91,7 +92,7 @@ Other performance knobs:
 ## Hardware (esp32-faux86 example)
 - Board: ESP32-S3 Dev Module with OPI PSRAM
 - Display: ILI9341 via SPI (SPI2: SCK=12, MISO=13, MOSI=11, CS=10, DC=7), 320×240, rotation 1
-- Keyboard: **INPUT_USB_HID** (default) — USB keyboard on native OTG port (GPIO19/20); or **INPUT_CARDKB** — M5Stack CardKB v1.1 on I2C (SDA=8, SCL=9, addr=0x5F)
+- Keyboard: **INPUT_USB_HID_ESPUSBHOST** (default) — EspUsbHost on native OTG port (GPIO19/20); or **INPUT_USB_HID_TINYUSB** (legacy TinyUSB); or **INPUT_CARDKB** — M5Stack CardKB v1.1 on I2C (SDA=8, SCL=9, addr=0x5F)
 - Touch: XPT2046 on SPI2 bus (shared with ILI9341), CS=4, polled mode (INT=255)
 - SD card: SPI3 (SCK=40, MISO=41, MOSI=42, CS=39)
 - Storage: SD card preferred (`/sd/hd0.img`); falls back to FFat (`/ffat/hd0_12m_games.img`)
@@ -109,11 +110,22 @@ Both `spi2` and `spi3` are `SPIClass` globals in the sketch. `touch.h` uses `TOU
 ## Input Method Selection
 Set at the top of `esp32-faux86.ino`:
 ```cpp
-#define INPUT_USB_HID   // native ESP32-S3 USB OTG — full keyboard, N-key rollover
-//#define INPUT_CARDKB  // M5Stack CardKB — single key, no rollover
+#define INPUT_USB_HID_ESPUSBHOST  // EspUsbHost — native OTG, N-key rollover (default)
+//#define INPUT_USB_HID_TINYUSB   // TinyUSB    — native OTG, N-key rollover (legacy)
+//#define INPUT_CARDKB            // M5Stack CardKB — single key, no rollover
 ```
-**INPUT_USB_HID board settings**: USB CDC On Boot = **Disable**; connect keyboard to the OTG/native USB port; use UART/COM port for Serial monitor.
-**INPUT_CARDKB board settings**: USB CDC On Boot = Enable (or either).
+
+| Define | USB Mode | USB CDC On Boot | Serial monitor port |
+|---|---|---|---|
+| `INPUT_USB_HID_ESPUSBHOST` | Hardware CDC and JTAG (TBD — see note) | Disable | UART/COM (CH340/CP2102) |
+| `INPUT_USB_HID_TINYUSB` | USB-OTG (TinyUSB) | Disable | UART/COM (CH340/CP2102) |
+| `INPUT_CARDKB` | either | Enable | USB CDC or UART |
+
+**Note on USB Mode for EspUsbHost:** not yet confirmed. EspUsbHost uses `usb_host_install()` (ESP-IDF OTG host driver) which may conflict with "Hardware CDC and JTAG" taking ownership of GPIO19/20. Still needs testing — try "Hardware CDC and JTAG" first, then "USB-OTG (TinyUSB)" if it doesn't work.
+
+**Serial monitor:** with USB CDC On Boot = Disable, Serial goes to UART0. Use the UART COM port (CH340/CP2102 chip), not the native USB port. If the board has only one USB connector (native OTG only, no onboard UART chip), an external USB-UART adapter is needed.
+
+**USB hub not supported:** The ESP-IDF USB host stack does not support USB hubs. The keyboard must be plugged **directly** into the ESP32-S3 OTG port — no hub in between.
 
 ## Uploading Disk Images
 **SD card (preferred):** Copy disk image to the root of the SD card as `hd0.img`.
@@ -142,6 +154,13 @@ The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m
 - ESP32-S3 has **no Classic Bluetooth hardware** — BLE only
 
 ## Alternative Keyboard Options (Research Notes)
+### EspUsbHost (tanakamasayuki/EspUsbHost) — integrated, pending hardware test
+- Uses ESP-IDF USB host driver (`usb_host_install()`) directly, bypassing TinyUSB
+- Implemented as `INPUT_USB_HID_ESPUSBHOST` in `usbhid_espusbhost.h`
+- **USB hub not supported** — ESP-IDF USB host stack has no hub support; keyboard must connect directly
+- Physical direct-connection currently blocked by adapter size — pending solution (right-angle adapter, BLE, etc.)
+- Debug prints added to `onKeyboard()` and `onGone()` — leave in until confirmed working
+
 ### bt-keyboard (turgu1/bt-keyboard) — parked
 - Targets **regular ESP32 only** (dual-mode Classic BT + BLE hardware); not designed for ESP32-S3
 - Uses Bluedroid stack (`CONFIG_BTDM_CTRL_MODE_BTDM=y`, `CONFIG_BT_CLASSIC_ENABLED=y`) — unavailable on S3
@@ -156,3 +175,4 @@ The sketch tries `/sd/hd0.img` first; if not found, falls back to `/ffat/hd0_12m
 - GFX Library for Arduino (Arduino_GFX)
 - TouchLib / XPT2046_Touchscreen (not in Library Manager; install from git)
 - SD (built into ESP32 Arduino core)
+- [EspUsbHost](https://github.com/tanakamasayuki/EspUsbHost) — ESP-IDF USB host wrapper for INPUT_USB_HID_ESPUSBHOST (not in Library Manager; install from git)
